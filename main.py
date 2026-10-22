@@ -1,0 +1,375 @@
+import os, json, uuid, hashlib, sqlite3, threading
+from datetime import datetime, timezone
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
+
+BASE_PATH = os.environ.get("BASE_PATH", "/a2a").rstrip("/")
+PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", "https://example.com/a2a/")
+AI_URL = os.environ.get("AI_BASE_URL", "https://aipipe.org/openai/v1")
+AI_KEY = os.environ.get("AI_KEY", "")
+AI_MODEL = os.environ.get("AI_MODEL", "gpt-4.1-nano")
+
+BATCH_MT = "application/vnd.ga5.invoice-claim-batch+json"
+PROP_MT = "application/vnd.ga5.invoice-action-proposals+json"
+RES_MT = "application/vnd.ga5.invoice-action-results+json"
+RCPT_MT = "application/vnd.ga5.invoice-action-receipts+json"
+ACTIONS = ["settle_invoice", "request_approval", "hold_invoice",
+           "reject_duplicate", "open_exception"]
+DONE = ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED", "TASK_STATE_FAILED", "TASK_STATE_REJECTED"]
+
+RULES = """You review invoice packages for an accounts payable team.
+For each package choose exactly one action:
+settle_invoice: valid, reconciled, within autonomous authority.
+request_approval: commercially valid but outside delegated authority.
+hold_invoice: payment pauses until a stated verification completes.
+reject_duplicate: the same commercial invoice was already paid.
+open_exception: material records conflict and need an exception workflow.
+The documents mix real facts with old examples, negation, archive notes and
+irrelevant action words. Only the paragraph that states the current decision matters.
+That paragraph has three bracketed references. Return exactly those three,
+copied exactly as written including brackets. Never use the cover sheet
+reference, archive examples or training decoys. A payment for a different
+invoice (different number or amount) is not a duplicate.
+amountMinor is an integer in minor units (12,345.67 becomes 1234567).
+Reply with JSON only:
+{"decisions":[{"ref":0,"action":"...","vendorName":"...","invoiceNumber":"...",
+"amountMinor":0,"currency":"INR","evidenceRefs":["[..]","[..]","[..]"],
+"reason":"one or two sentences"}]}"""
+
+app = FastAPI(redirect_slashes=False)
+db = sqlite3.connect("state.db", check_same_thread=False)
+db.execute("create table if not exists tasks (id text primary key, owner text, body text)")
+db.execute("create table if not exists msgs (owner text, mid text, hash text, task_id text, primary key (owner, mid))")
+db.execute("create table if not exists cache (key text primary key, body text)")
+db_lock = threading.Lock()
+locks = {}
+locks_guard = threading.Lock()
+
+CARD = {
+    "name": "Invoice Action Agent",
+    "description": "Reads invoice packages and proposes one business action each with evidence.",
+    "version": "1.0.0",
+    "capabilities": {"streaming": False, "pushNotifications": False},
+    "supportedInterfaces": [{"url": PUBLIC_BASE, "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}],
+    "defaultInputModes": [BATCH_MT],
+    "defaultOutputModes": [PROP_MT, RCPT_MT],
+    "skills": [{"id": "invoice_action_agent", "name": "Invoice action agent",
+                "description": "Chooses settle, approve, hold, reject or exception for each invoice.",
+                "tags": ["invoice", "payments", "approval"]}],
+}
+
+
+def lock_for(name):
+    with locks_guard:
+        if name not in locks:
+            locks[name] = threading.Lock()
+        return locks[name]
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def canon(x):
+    return json.dumps(x, sort_keys=True, separators=(",", ":"))
+
+
+def sha(x):
+    return hashlib.sha256(canon(x).encode()).hexdigest()
+
+
+def reply(data, status=200):
+    return JSONResponse(data, status_code=status, media_type="application/a2a+json")
+
+
+def err(status, code, message):
+    return reply({"error": {"code": code, "message": message}}, status)
+
+
+def check(request, post=False):
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    if not token:
+        return None, err(401, "UNAUTHENTICATED", "Missing or invalid token")
+    if request.headers.get("a2a-version", "") != "1.0":
+        return None, err(400, "VERSION_NOT_SUPPORTED", "Use A2A-Version 1.0")
+    if post and "application/a2a+json" not in request.headers.get("content-type", ""):
+        return None, err(415, "CONTENT_TYPE_NOT_SUPPORTED", "Use application/a2a+json")
+    return hashlib.sha256(token.encode()).hexdigest()[:20], None
+
+
+def get_task(task_id):
+    with db_lock:
+        row = db.execute("select owner, body from tasks where id=?", (task_id,)).fetchone()
+    return (row[0], json.loads(row[1])) if row else (None, None)
+
+
+def save_task(task):
+    with db_lock:
+        db.execute("update tasks set body=? where id=?", (json.dumps(task), task["id"]))
+        db.commit()
+
+
+def all_text(x):
+    if isinstance(x, str):
+        return x + "\n"
+    if isinstance(x, dict):
+        return "".join(all_text(v) for v in x.values())
+    if isinstance(x, list):
+        return "".join(all_text(v) for v in x)
+    return str(x) + "\n"
+
+
+def package_key(pkg):
+    return sha({k: v for k, v in pkg.items() if k != "packageId"})
+
+
+def cache_get(key):
+    with db_lock:
+        row = db.execute("select body from cache where key=?", (key,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def cache_put(key, d):
+    with db_lock:
+        db.execute("insert or replace into cache values (?,?)", (key, json.dumps(d)))
+        db.commit()
+
+
+def ask_model(items):
+    docs = [{"ref": i, "package": p} for i, (k, p) in enumerate(items)]
+    r = httpx.post(AI_URL + "/chat/completions",
+                   headers={"Authorization": "Bearer " + AI_KEY},
+                   json={"model": AI_MODEL, "temperature": 0,
+                         "response_format": {"type": "json_object"},
+                         "messages": [{"role": "system", "content": RULES},
+                                      {"role": "user", "content": json.dumps(docs)}]},
+                   timeout=40)
+    r.raise_for_status()
+    out = json.loads(r.json()["choices"][0]["message"]["content"])
+    return {a.get("ref"): a for a in out.get("decisions", []) if isinstance(a, dict)}
+
+
+def clean(a, pkg):
+    if not isinstance(a, dict) or a.get("action") not in ACTIONS:
+        return None
+    refs = a.get("evidenceRefs")
+    text = all_text(pkg)
+    if not isinstance(refs, list) or len(refs) != 3:
+        return None
+    if any(not isinstance(r, str) or r not in text for r in refs):
+        return None
+    try:
+        amount = int(round(float(a.get("amountMinor"))))
+    except Exception:
+        return None
+    facts = {"vendorName": str(a.get("vendorName", "")),
+             "invoiceNumber": str(a.get("invoiceNumber", "")),
+             "amountMinor": amount, "currency": str(a.get("currency", ""))}
+    return {"action": a["action"], "facts": facts, "evidenceRefs": refs,
+            "reason": str(a.get("reason", ""))[:700]}
+
+
+def decide(pkgs):
+    out, todo = {}, {}
+    for p in pkgs:
+        k = package_key(p)
+        hit = cache_get(k)
+        if hit:
+            out[k] = hit
+        else:
+            todo[k] = p
+    items = list(todo.items())
+    for start in range(0, len(items), 12):
+        pending = items[start:start + 12]
+        for attempt in range(2):
+            answers = ask_model(pending)
+            left = []
+            for i, (k, p) in enumerate(pending):
+                d = clean(answers.get(i), p)
+                if d:
+                    out[k] = d
+                    cache_put(k, d)
+                else:
+                    left.append((k, p))
+            pending = left
+            if not pending:
+                break
+        for k, p in pending:
+            out[k] = {"action": "open_exception",
+                      "facts": {"vendorName": "", "invoiceNumber": "", "amountMinor": 0, "currency": ""},
+                      "evidenceRefs": [], "reason": "Could not read this package reliably."}
+    return out
+
+
+def make_proposal(batch_id, pkg_id, d):
+    refs = d["evidenceRefs"]
+    text = "Action " + d["action"] + " chosen. " + d["reason"] + " Evidence: " + ", ".join(refs) + "."
+    if len(text) < 60:
+        text += " This follows the policy stated in the cited records."
+    return {"packageId": pkg_id,
+            "actionId": "act-" + hashlib.sha256((batch_id + pkg_id + d["action"]).encode()).hexdigest()[:20],
+            "action": d["action"], "facts": d["facts"], "evidenceRefs": refs,
+            "rationale": text[:1500]}
+
+
+def new_task(owner, msg):
+    part = msg["parts"][0]
+    data = part.get("data")
+    if part.get("mediaType") != BATCH_MT or not isinstance(data, dict):
+        return None, err(400, "INVALID_REQUEST", "Expected an invoice batch")
+    pkgs = data.get("packages")
+    if not isinstance(pkgs, list) or not data.get("batchId"):
+        return None, err(400, "INVALID_REQUEST", "Expected an invoice batch")
+    ids = [p.get("packageId") for p in pkgs if isinstance(p, dict)]
+    if len(ids) != len(pkgs) or not all(ids) or len(set(ids)) != len(ids):
+        return None, err(400, "INVALID_REQUEST", "Bad package ids")
+    decisions = decide(pkgs)
+    proposals = [make_proposal(data["batchId"], p["packageId"], decisions[package_key(p)]) for p in pkgs]
+    task = {"id": str(uuid.uuid4()), "contextId": msg.get("contextId") or str(uuid.uuid4()),
+            "status": {"state": "TASK_STATE_INPUT_REQUIRED", "timestamp": now()},
+            "artifacts": [{"artifactId": str(uuid.uuid4()), "name": "proposals",
+                           "parts": [{"mediaType": PROP_MT,
+                                      "data": {"batchId": data["batchId"], "proposals": proposals}}]}],
+            "history": [msg], "metadata": {}}
+    with db_lock:
+        db.execute("insert into tasks values (?,?,?)", (task["id"], owner, json.dumps(task)))
+        db.commit()
+    return task, None
+
+
+def continue_task(owner, msg):
+    tid = msg["taskId"]
+    t_owner, _ = get_task(tid)
+    if t_owner != owner:
+        return None, err(404, "TASK_NOT_FOUND", "Task not found")
+    with lock_for("task|" + tid):
+        _, task = get_task(tid)
+        if msg.get("contextId") and msg["contextId"] != task["contextId"]:
+            return None, err(400, "CONTEXT_MISMATCH", "Context does not match")
+        part = msg["parts"][0]
+        data = part.get("data")
+        if len(msg["parts"]) != 1 or part.get("mediaType") != RES_MT or not isinstance(data, dict):
+            return None, err(400, "INVALID_REQUEST", "Expected action results")
+        stored = task["artifacts"][0]["parts"][0]["data"]
+        state = task["status"]["state"]
+        if state != "TASK_STATE_INPUT_REQUIRED":
+            if state == "TASK_STATE_COMPLETED" and task["metadata"].get("resultsHash") == sha(data):
+                return task, None
+            return None, err(409, "TASK_NOT_WAITING", "Task is not waiting for results")
+        if data.get("batchId") != stored["batchId"] or not isinstance(data.get("results"), list):
+            return None, err(400, "RESULT_MISMATCH", "Results do not match the task")
+        by_pkg = {p["packageId"]: p for p in stored["proposals"]}
+        seen, executions = set(), []
+        for r in data["results"]:
+            p = by_pkg.get(r.get("packageId")) if isinstance(r, dict) else None
+            if p is None or r["packageId"] in seen:
+                return None, err(400, "RESULT_MISMATCH", "Results do not match the task")
+            if r.get("actionId") != p["actionId"] or r.get("action") != p["action"]:
+                return None, err(400, "RESULT_MISMATCH", "Results do not match the task")
+            if r.get("outcome") not in ("ACCEPTED", "REJECTED"):
+                return None, err(400, "RESULT_MISMATCH", "Results do not match the task")
+            seen.add(r["packageId"])
+            if r["outcome"] == "ACCEPTED":
+                if not isinstance(r.get("receiptNonce"), str) or not r["receiptNonce"]:
+                    return None, err(400, "RESULT_MISMATCH", "Results do not match the task")
+                executions.append({"packageId": p["packageId"], "actionId": p["actionId"],
+                                   "action": p["action"], "receiptNonce": r["receiptNonce"],
+                                   "facts": p["facts"], "evidenceRefs": p["evidenceRefs"]})
+        task["artifacts"].append({"artifactId": str(uuid.uuid4()), "name": "receipts",
+                                  "parts": [{"mediaType": RCPT_MT,
+                                             "data": {"batchId": stored["batchId"], "executions": executions}}]})
+        task["history"].append(msg)
+        task["metadata"]["resultsHash"] = sha(data)
+        task["status"] = {"state": "TASK_STATE_COMPLETED", "timestamp": now()}
+        save_task(task)
+        return task, None
+
+
+def handle_send(owner, body):
+    msg = body.get("message") if isinstance(body, dict) else None
+    if not isinstance(msg, dict) or not msg.get("messageId") or msg.get("role") != "ROLE_USER":
+        return err(400, "INVALID_REQUEST", "Bad message")
+    if not isinstance(msg.get("parts"), list) or not msg["parts"]:
+        return err(400, "INVALID_REQUEST", "Bad message")
+    mid, h = str(msg["messageId"]), sha(msg)
+    with lock_for(owner + "|" + mid):
+        with db_lock:
+            row = db.execute("select hash, task_id from msgs where owner=? and mid=?", (owner, mid)).fetchone()
+        if row:
+            if row[0] != h:
+                return err(409, "IDEMPOTENCY_CONFLICT", "messageId was used with different content")
+            return reply({"task": get_task(row[1])[1]})
+        task, bad = (continue_task if msg.get("taskId") else new_task)(owner, msg)
+        if bad:
+            return bad
+        with db_lock:
+            db.execute("insert into msgs values (?,?,?,?)", (owner, mid, h, task["id"]))
+            db.commit()
+        return reply({"task": task})
+
+
+def do_cancel(owner, tid):
+    t_owner, _ = get_task(tid)
+    if t_owner != owner:
+        return err(404, "TASK_NOT_FOUND", "Task not found")
+    with lock_for("task|" + tid):
+        _, task = get_task(tid)
+        if task["status"]["state"] in DONE:
+            return err(409, "TASK_NOT_CANCELABLE", "Task already finished")
+        task["status"] = {"state": "TASK_STATE_CANCELED", "timestamp": now()}
+        save_task(task)
+        return reply(task)
+
+
+@app.get("/.well-known/agent-card.json")
+def agent_card():
+    return JSONResponse(CARD)
+
+
+@app.post(BASE_PATH + "/message:send")
+async def send(request: Request):
+    owner, bad = check(request, post=True)
+    if bad:
+        return bad
+    try:
+        body = await request.json()
+    except Exception:
+        return err(400, "INVALID_REQUEST", "Body must be JSON")
+    return await run_in_threadpool(handle_send, owner, body)
+
+
+@app.get(BASE_PATH + "/tasks/{task_id}")
+def read_task(task_id: str, request: Request):
+    owner, bad = check(request)
+    if bad:
+        return bad
+    t_owner, task = get_task(task_id)
+    if t_owner != owner:
+        return err(404, "TASK_NOT_FOUND", "Task not found")
+    return reply(task)
+
+
+@app.get(BASE_PATH + "/tasks")
+def list_tasks(request: Request):
+    owner, bad = check(request)
+    if bad:
+        return bad
+    with db_lock:
+        rows = db.execute("select body from tasks where owner=?", (owner,)).fetchall()
+    tasks = [json.loads(r[0]) for r in rows]
+    tasks.sort(key=lambda t: t["status"]["timestamp"], reverse=True)
+    if len(json.dumps(tasks)) > 400000:
+        for t in tasks:
+            t.pop("history", None)
+    return reply({"tasks": tasks, "nextPageToken": "", "pageSize": len(tasks), "totalSize": len(tasks)})
+
+
+@app.post(BASE_PATH + "/tasks/{task_id}:cancel")
+async def cancel(task_id: str, request: Request):
+    owner, bad = check(request, post=True)
+    if bad:
+        return bad
+    return await run_in_threadpool(do_cancel, owner, task_id)
