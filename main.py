@@ -1,6 +1,8 @@
 import os, json, uuid, hashlib, sqlite3, threading
 from datetime import datetime, timezone
 import httpx
+import time
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
@@ -33,6 +35,7 @@ copied exactly as written including brackets. Never use the cover sheet
 reference, archive examples or training decoys. A payment for a different
 invoice (different number or amount) is not a duplicate.
 amountMinor is an integer in minor units (12,345.67 becomes 1234567).
+For each package: 1) find the paragraph that states the current decision and its three bracketed references; ignore archive notes, training examples, the cover sheet, and negated sentences such as "do not settle". 2) A duplicate means the same vendor, invoice number and amount was already paid; a payment for a different invoice number is not a duplicate. 3) If the amount is above the delegated authority limit in the policy, choose request_approval. 4) If payment must wait for a stated verification, choose hold_invoice. 5) If purchase order, receipt and invoice records conflict materially, choose open_exception. 6) Choose settle_invoice only when every check is clean and within authority. When unsure, never settle.
 Reply with JSON only:
 {"decisions":[{"ref":0,"action":"...","vendorName":"...","invoiceNumber":"...",
 "amountMinor":0,"currency":"INR","evidenceRefs":["[..]","[..]","[..]"],
@@ -138,24 +141,15 @@ def cache_put(key, d):
         db.commit()
 
 
-def ask_model(items):
-    docs = [{"ref": i, "package": p} for i, (k, p) in enumerate(items)]
-    r = httpx.post(AI_URL + "/chat/completions",
-                   headers={"Authorization": "Bearer " + AI_KEY},
-                   json={"model": AI_MODEL, "temperature": 0,
-                         "response_format": {"type": "json_object"},
-                         "messages": [{"role": "system", "content": RULES},
-                                      {"role": "user", "content": json.dumps(docs)}]},
-                   timeout=40)
-    r.raise_for_status()
-    out = json.loads(r.json()["choices"][0]["message"]["content"])
-    return {a.get("ref"): a for a in out.get("decisions", []) if isinstance(a, dict)}
+
 
 
 def clean(a, pkg):
     if not isinstance(a, dict) or a.get("action") not in ACTIONS:
         return None
     refs = a.get("evidenceRefs")
+    if isinstance(refs, list):
+        refs = [r if isinstance(r, str) and r.startswith("[") else "[" + str(r) + "]" for r in refs]
     text = all_text(pkg)
     if not isinstance(refs, list) or len(refs) != 3:
         return None
@@ -172,7 +166,42 @@ def clean(a, pkg):
             "reason": str(a.get("reason", ""))[:700]}
 
 
-def decide(pkgs):
+def ask_model(items, policy):
+    docs = [{"ref": i, "package": p} for i, (k, p) in enumerate(items)]
+    r = httpx.post(AI_URL + "/chat/completions",
+                   headers={"Authorization": "Bearer " + AI_KEY},
+                   json={"model": AI_MODEL, "temperature": 0,
+                         "response_format": {"type": "json_object"},
+                         "messages": [{"role": "system", "content": RULES},
+                                      {"role": "user", "content": json.dumps({"policyRevision": policy, "packages": docs})}]},
+                   timeout=30)
+    r.raise_for_status()
+    out = json.loads(r.json()["choices"][0]["message"]["content"])
+    return {a.get("ref"): a for a in out.get("decisions", []) if isinstance(a, dict)}
+
+
+def solve(chunk, policy, started):
+    got, pending = {}, chunk
+    for attempt in range(2):
+        if not pending or time.time() - started > 25:
+            break
+        try:
+            answers = ask_model(pending, policy)
+        except Exception as e:
+            print("model error", repr(e)[:300])
+            continue
+        left = []
+        for i, (k, p) in enumerate(pending):
+            d = clean(answers.get(i), p)
+            if d:
+                got[k] = d
+            else:
+                left.append((k, p))
+        pending = left
+    return got
+
+
+def decide(pkgs, policy):
     out, todo = {}, {}
     for p in pkgs:
         k = package_key(p)
@@ -182,27 +211,20 @@ def decide(pkgs):
         else:
             todo[k] = p
     items = list(todo.items())
-    for start in range(0, len(items), 12):
-        pending = items[start:start + 12]
-        for attempt in range(2):
-            answers = ask_model(pending)
-            left = []
-            for i, (k, p) in enumerate(pending):
-                d = clean(answers.get(i), p)
-                if d:
+    chunks = [items[i:i + 6] for i in range(0, len(items), 6)]
+    started = time.time()
+    if chunks:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for got in pool.map(lambda c: solve(c, policy, started), chunks):
+                for k, d in got.items():
                     out[k] = d
                     cache_put(k, d)
-                else:
-                    left.append((k, p))
-            pending = left
-            if not pending:
-                break
-        for k, p in pending:
+    for k in todo:
+        if k not in out:
             out[k] = {"action": "open_exception",
                       "facts": {"vendorName": "", "invoiceNumber": "", "amountMinor": 0, "currency": ""},
                       "evidenceRefs": [], "reason": "Could not read this package reliably."}
     return out
-
 
 def make_proposal(batch_id, pkg_id, d):
     refs = d["evidenceRefs"]
@@ -226,8 +248,10 @@ def new_task(owner, msg):
     ids = [p.get("packageId") for p in pkgs if isinstance(p, dict)]
     if len(ids) != len(pkgs) or not all(ids) or len(set(ids)) != len(ids):
         return None, err(400, "INVALID_REQUEST", "Bad package ids")
-    decisions = decide(pkgs)
+    decisions = decide(pkgs, data.get("policyRevision"))
     proposals = [make_proposal(data["batchId"], p["packageId"], decisions[package_key(p)]) for p in pkgs]
+    print("BATCH", data["batchId"], [p["action"] for p in proposals])
+    print("SAMPLE", json.dumps(pkgs[0])[:3500])
     task = {"id": str(uuid.uuid4()), "contextId": msg.get("contextId") or str(uuid.uuid4()),
             "status": {"state": "TASK_STATE_INPUT_REQUIRED", "timestamp": now()},
             "artifacts": [{"artifactId": str(uuid.uuid4()), "name": "proposals",
@@ -369,7 +393,7 @@ def list_tasks(request: Request):
 
 @app.post(BASE_PATH + "/tasks/{task_id}:cancel")
 async def cancel(task_id: str, request: Request):
-    owner, bad = check(request, post=True)
+    owner, bad = check(request)
     if bad:
         return bad
     return await run_in_threadpool(do_cancel, owner, task_id)
