@@ -11,7 +11,8 @@ BASE_PATH = os.environ.get("BASE_PATH", "/a2a").rstrip("/")
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", "https://example.com/a2a/")
 AI_URL = os.environ.get("AI_BASE_URL", "https://aipipe.org/openai/v1")
 AI_KEY = os.environ.get("AI_KEY", "")
-AI_MODEL = os.environ.get("AI_MODEL", "gpt-4.1-nano")
+AI_MODEL = os.environ.get("AI_MODEL", "gpt-4.1-mini")
+AI_MODEL_STRONG = os.environ.get("AI_MODEL_STRONG", AI_MODEL)
 
 BATCH_MT = "application/vnd.ga5.invoice-claim-batch+json"
 PROP_MT = "application/vnd.ga5.invoice-action-proposals+json"
@@ -36,10 +37,28 @@ reference, archive examples or training decoys. A payment for a different
 invoice (different number or amount) is not a duplicate.
 amountMinor is an integer in minor units (12,345.67 becomes 1234567).
 For each package: 1) find the paragraph that states the current decision and its three bracketed references; ignore archive notes, training examples, the cover sheet, and negated sentences such as "do not settle". 2) A duplicate means the same vendor, invoice number and amount was already paid; a payment for a different invoice number is not a duplicate. 3) If the amount is above the delegated authority limit in the policy, choose request_approval. 4) If payment must wait for a stated verification, choose hold_invoice. 5) If purchase order, receipt and invoice records conflict materially, choose open_exception. 6) Choose settle_invoice only when every check is clean and within authority. When unsure, never settle.
+Settling is the most dangerous mistake: paying an invoice that needed approval, a hold,
+duplicate rejection or an exception is far worse than being cautious. Settle ONLY when the
+current-decision paragraph clearly shows a clean, reconciled invoice within authority.
+Work in this order for every package and put your work in the JSON fields, in this order:
+ a) decisivePassage: copy verbatim the paragraph that states the CURRENT decision.
+ b) ignored: say which other sentences you ignored (archive, training, negated, cover sheet).
+ c) the four booleans in checks, answered from the decisive passage and the policy.
+ d) only then the action, which must agree with the booleans:
+    duplicateOfPaidInvoice true -> reject_duplicate; recordsConflict true -> open_exception;
+    verificationPending true -> hold_invoice; amountAboveAuthority true -> request_approval;
+    settle_invoice only if all four are false.
 Reply with JSON only:
-{"decisions":[{"ref":0,"action":"...","vendorName":"...","invoiceNumber":"...",
-"amountMinor":0,"currency":"INR","evidenceRefs":["[..]","[..]","[..]"],
-"reason":"one or two sentences"}]}"""
+{"decisions":[{"ref":0,"decisivePassage":"...","ignored":"...",
+"checks":{"duplicateOfPaidInvoice":false,"recordsConflict":false,"verificationPending":false,"amountAboveAuthority":false},
+"action":"...","vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR",
+"evidenceRefs":["[..]","[..]","[..]"],"reason":"one or two sentences"}]}"""
+
+SKEPTIC = """You are a skeptical second reviewer. A first reviewer chose settle_invoice for the package.
+Look for any reason that is wrong: the current-decision paragraph asks for approval, a hold or
+verification, says the invoice was already paid, shows conflicting records, or the amount is above
+the delegated authority. Ignore archive notes, training examples, the cover sheet and negated
+sentences. Reply with JSON only: {"settleIsSafe": true or false, "why": "short"}"""
 
 app = FastAPI(redirect_slashes=False)
 db = sqlite3.connect("state.db", check_same_thread=False)
@@ -155,6 +174,13 @@ def clean(a, pkg):
         return None
     if any(not isinstance(r, str) or r not in text for r in refs):
         return None
+    ck = a.get("checks")
+    if isinstance(ck, dict):
+        if a["action"] == "settle_invoice" and any(ck.get(k) for k in
+                ("duplicateOfPaidInvoice", "recordsConflict", "verificationPending", "amountAboveAuthority")):
+            return None
+        if a["action"] == "reject_duplicate" and not ck.get("duplicateOfPaidInvoice"):
+            return None
     try:
         amount = int(round(float(a.get("amountMinor"))))
     except Exception:
@@ -166,39 +192,71 @@ def clean(a, pkg):
             "reason": str(a.get("reason", ""))[:700]}
 
 
-def ask_model(items, policy):
-    docs = [{"ref": i, "package": p} for i, (k, p) in enumerate(items)]
+def call_model(model, system, user, started, timeout_cap=25):
+    left = 42 - (time.time() - started)
     r = httpx.post(AI_URL + "/chat/completions",
                    headers={"Authorization": "Bearer " + AI_KEY},
-                   json={"model": AI_MODEL, "temperature": 0,
+                   json={"model": model, "temperature": 0,
                          "response_format": {"type": "json_object"},
-                         "messages": [{"role": "system", "content": RULES},
-                                      {"role": "user", "content": json.dumps({"policyRevision": policy, "packages": docs})}]},
-                   timeout=30)
+                         "messages": [{"role": "system", "content": system},
+                                      {"role": "user", "content": user}]},
+                   timeout=max(6, min(timeout_cap, left)))
     r.raise_for_status()
-    out = json.loads(r.json()["choices"][0]["message"]["content"])
+    return json.loads(r.json()["choices"][0]["message"]["content"])
+
+
+def ask_model(items, policy, started, forbid_settle=False):
+    docs = [{"ref": i, "package": p} for i, (k, p) in enumerate(items)]
+    system = RULES
+    if forbid_settle:
+        system += "\nA reviewer found that settle_invoice is NOT safe for these packages. Do not choose settle_invoice."
+    out = call_model(AI_MODEL_STRONG if forbid_settle else AI_MODEL, system,
+                     json.dumps({"policyRevision": policy, "packages": docs}), started)
     return {a.get("ref"): a for a in out.get("decisions", []) if isinstance(a, dict)}
 
 
-def solve(chunk, policy, started):
+def solve(chunk, policy, started, forbid_settle=False):
     got, pending = {}, chunk
     for attempt in range(2):
-        if not pending or time.time() - started > 25:
+        if not pending or time.time() - started > (30 if forbid_settle else 24):
             break
         try:
-            answers = ask_model(pending, policy)
+            answers = ask_model(pending, policy, started, forbid_settle)
         except Exception as e:
             print("model error", repr(e)[:300])
             continue
         left = []
         for i, (k, p) in enumerate(pending):
             d = clean(answers.get(i), p)
+            if d and forbid_settle and d["action"] == "settle_invoice":
+                d = None
             if d:
                 got[k] = d
             else:
                 left.append((k, p))
         pending = left
+    # last resort: one package at a time, never a blanket answer
+    for k, p in list(pending):
+        if time.time() - started > 36:
+            break
+        try:
+            d = clean(ask_model([(k, p)], policy, started, forbid_settle).get(0), p)
+            if d and not (forbid_settle and d["action"] == "settle_invoice"):
+                got[k] = d
+        except Exception as e:
+            print("model error single", repr(e)[:200])
     return got
+
+
+def skeptic_check(item, policy, started):
+    k, p = item
+    try:
+        out = call_model(AI_MODEL_STRONG, SKEPTIC,
+                         json.dumps({"policyRevision": policy, "package": p}), started, 15)
+        return k, bool(out.get("settleIsSafe"))
+    except Exception as e:
+        print("skeptic error", repr(e)[:200])
+        return k, False
 
 
 def decide(pkgs, policy):
@@ -211,20 +269,40 @@ def decide(pkgs, policy):
         else:
             todo[k] = p
     items = list(todo.items())
-    chunks = [items[i:i + 6] for i in range(0, len(items), 6)]
     started = time.time()
-    if chunks:
+    fresh = {}
+    if items:
+        chunks = [items[i:i + 4] for i in range(0, len(items), 4)]
         with ThreadPoolExecutor(max_workers=4) as pool:
             for got in pool.map(lambda c: solve(c, policy, started), chunks):
-                for k, d in got.items():
-                    out[k] = d
-                    cache_put(k, d)
+                fresh.update(got)
+        # second, skeptical look at every settle decision
+        settles = [(k, todo[k]) for k, d in fresh.items() if d["action"] == "settle_invoice"]
+        redo = []
+        if settles:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for k, safe in pool.map(lambda it: skeptic_check(it, policy, started), settles):
+                    if not safe:
+                        redo.append((k, todo[k]))
+        if redo:
+            print("SKEPTIC rejected settle for", len(redo), "packages")
+            chunks = [redo[i:i + 4] for i in range(0, len(redo), 4)]
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for got in pool.map(lambda c: solve(c, policy, started, True), chunks):
+                    fresh.update(got)
+            for k, p in redo:  # never keep an unsafe settle
+                if fresh.get(k, {}).get("action") == "settle_invoice":
+                    del fresh[k]
+        for k, d in fresh.items():
+            out[k] = d
+            cache_put(k, d)
     for k in todo:
         if k not in out:
             out[k] = {"action": "open_exception",
                       "facts": {"vendorName": "", "invoiceNumber": "", "amountMinor": 0, "currency": ""},
                       "evidenceRefs": [], "reason": "Could not read this package reliably."}
     return out
+
 
 def make_proposal(batch_id, pkg_id, d):
     refs = d["evidenceRefs"]
