@@ -174,7 +174,7 @@ def cache_put(key, d):
 
 REF_RE = re.compile(r"\[R_[A-Za-z0-9]+\]")
 FACT_RE = re.compile(r"Supplier\s+(.+?);\s*invoice\s+(\S+?);\s*stated total\s+([A-Z]{3})\s+([0-9][0-9,]*(?:\.[0-9]+)?)")
-NOISE_RE = re.compile(r"The referenced office was [A-Za-z .]+ and the audit export sequence was \d+\.?")
+NOISE_RE = re.compile(r"(?:The referenced office was [A-Za-z .]+ and the audit export sequence was \d+|Review location [A-Za-z .]+; docket \d+)\.?")
 
 
 def paras(pkg):
@@ -235,6 +235,119 @@ def view(pkg):
     if info["facts"]:
         v["coverSheetFacts"] = info["facts"]
     return v
+
+
+PAT = {
+    "reject_duplicate": r"same commercial key|earlier settled entry|second disbursement|earlier posting for the same|exact commercial duplicate|already been paid",
+    "hold_invoice": r"beneficiary details|newly supplied bank account|destination-account change|previously registered number|known-number callback|pre-existing contact channel|out-of-band check|payment-detail changes",
+    "open_exception": r"does not reconcile with|outside the permitted reconciliation tolerance|incompatible|contradictory signed records|exception (?:workflow|queue|case)|conflicts with the receiving valuation",
+    "request_approval": r"outside the operator's .{0,40}authority|delegation ceiling|without escalation only up to|financial-approval workflow|named (?:financial )?approver|larger reconciled payments",
+    "settle_invoice": r"same payable total|within the stated rounding tolerance|reconciled price, quantity, tax, and currency",
+}
+DECOY_RE = re.compile(r"\b(closed|archiv\w*|unrelated|historical|expired|training|hypothetical|govern no live case|separate supplier|not this vendor)\b", re.I)
+
+
+def classify(par):
+    hits = [a for a, p in PAT.items() if re.search(p, par, re.I)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def live_refs(pkg):
+    """Narrative-style packages: one reference per paragraph. Live records are the ones that are not
+    cover sheet, archive, training, expired or otherwise marked as not applying."""
+    live = []
+    for n, p in paras(pkg):
+        r = uniq(REF_RE.findall(p))
+        if len(r) != 1 or FACT_RE.search(p):
+            continue
+        if DECOY_RE.search(p):
+            continue
+        live.append((r[0], p))
+    return live
+
+
+def view_b(pkg):
+    recs = []
+    for n, p in paras(pkg):
+        if NOISE_RE.search(p) and not REF_RE.search(p):
+            continue
+        refs = uniq(REF_RE.findall(p))
+        recs.append({"document": n, "text": p, "refs": refs, "decoyHint": bool(DECOY_RE.search(p)) or None})
+    return {"records": recs}
+
+
+RULES_B = """You decide one invoice case for an accounts payable team. The case file has records, many with one
+reference like [R_XXXX]. Some records are decoys: closed or unrelated cases, archive notes, training examples,
+expired policies, historical payments for another order. decoyHint marks likely decoys but read the text yourself.
+The live records state: the signed order and receiving and invoice facts, the payment ledger, and the vendor master,
+bank-detail callback and authority ceiling. Work out these facts from the live records only:
+ - sameOrderAlreadyPaid: true only if a payment already discharged THIS SAME order or invoice (same order/invoice
+   identifier). A payment of the same amount to the same vendor for a DIFFERENT order or invoice is NOT a duplicate.
+ - materialOrderInvoiceDifference: true only if the signed order, receipt and invoice materially disagree
+   (different totals or quantities with no corrected invoice). Matching totals mean false.
+ - bankChangeUnverified: true only if the live records show a bank or remittance change whose callback or
+   verification through the established channel is NOT completed. A confirmed callback means false. A bank change
+   mentioned only in a training or archive record means false.
+ - payableTotal: the submitted invoice total as a plain number, and currency its 3-letter code.
+ - delegationCeiling: the autonomous payment ceiling in the same currency as a plain number, or null if none is stated
+   in the live records.
+Also give vendorName (the supplier being paid), invoiceNumber (the identifier of the current order or invoice, for
+example PO-41708 or INV-...), and evidenceRefs: exactly the three references of the live records that decide the case,
+copied with brackets. Never use decoy, cover-sheet, archive or training references.
+Reply with JSON only:
+{"findings":["..","..",".."],"sameOrderAlreadyPaid":false,"materialOrderInvoiceDifference":false,
+"bankChangeUnverified":false,"payableTotal":0,"currency":"INR","delegationCeiling":null,
+"vendorName":"","invoiceNumber":"","evidenceRefs":["[..]","[..]","[..]"],"reason":"one or two sentences"}"""
+
+
+def to_minor(x):
+    try:
+        return int((Decimal(str(x).replace(",", "")) * 100).to_integral_value())
+    except Exception:
+        return None
+
+
+def decide_b(pkg, policy, started):
+    text = all_text(pkg)
+    live = live_refs(pkg)
+    for attempt in range(2):
+        if time.time() - started > 34:
+            break
+        try:
+            a = call_model(AI_MODEL_STRONG, RULES_B,
+                           json.dumps({"policyRevision": policy, "case": view_b(pkg)}), started, 28)
+        except Exception as e:
+            print("model error B", repr(e)[:200])
+            continue
+        total, minor = a.get("payableTotal"), to_minor(a.get("payableTotal"))
+        if minor is None:
+            continue
+        ceiling = a.get("delegationCeiling")
+        try:
+            over = ceiling is not None and Decimal(str(ceiling).replace(",", "")) < Decimal(str(total).replace(",", ""))
+        except Exception:
+            over = False
+        if a.get("sameOrderAlreadyPaid"):
+            act = "reject_duplicate"
+        elif a.get("materialOrderInvoiceDifference"):
+            act = "open_exception"
+        elif a.get("bankChangeUnverified"):
+            act = "hold_invoice"
+        elif over:
+            act = "request_approval"
+        else:
+            act = "settle_invoice"
+        if len(live) == 3:
+            refs = [r for r, _ in live]
+        else:
+            refs = a.get("evidenceRefs")
+            if not isinstance(refs, list) or len(refs) != 3 or any(not isinstance(r, str) or r not in text for r in refs):
+                continue
+        return {"action": act, "src": "B",
+                "facts": {"vendorName": str(a.get("vendorName", "")), "invoiceNumber": str(a.get("invoiceNumber", "")),
+                          "amountMinor": minor, "currency": str(a.get("currency", ""))},
+                "evidenceRefs": refs, "reason": str(a.get("reason", ""))[:700]}
+    return None
 
 
 
@@ -348,16 +461,32 @@ def decide(pkgs, policy):
             out[k] = hit
         else:
             todo[k] = p
-    items = list(todo.items())
     started = time.time()
-    fresh = {}
-    if items:
-        chunks = [items[i:i + 4] for i in range(0, len(items), 4)]
+    fresh, model_items, b_items = {}, [], []
+    for k, p in todo.items():
+        info = det_info(p)
+        if info["decisive"]:
+            act = classify(info["decisive"])
+            if act and info["facts"] and info["refs"]:
+                fresh[k] = {"action": act, "src": "rule", "facts": info["facts"], "evidenceRefs": info["refs"],
+                            "reason": info["decisive"][:700]}
+            else:
+                model_items.append((k, p))
+        else:
+            b_items.append((k, p))
+    if b_items:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for (k, p), d in zip(b_items, pool.map(lambda it: decide_b(it[1], policy, started), b_items)):
+                if d:
+                    fresh[k] = d
+                else:
+                    model_items.append((k, p))
+    if model_items:  # unfamiliar wording: model, then skeptical look at any settle
+        chunks = [model_items[i:i + 4] for i in range(0, len(model_items), 4)]
         with ThreadPoolExecutor(max_workers=4) as pool:
             for got in pool.map(lambda c: solve(c, policy, started), chunks):
                 fresh.update(got)
-        # second, skeptical look at every settle decision
-        settles = [(k, todo[k]) for k, d in fresh.items() if d["action"] == "settle_invoice"]
+        settles = [(k, todo[k]) for k, _ in model_items if fresh.get(k, {}).get("action") == "settle_invoice"]
         redo = []
         if settles:
             with ThreadPoolExecutor(max_workers=4) as pool:
@@ -370,12 +499,12 @@ def decide(pkgs, policy):
             with ThreadPoolExecutor(max_workers=4) as pool:
                 for got in pool.map(lambda c: solve(c, policy, started, True), chunks):
                     fresh.update(got)
-            for k, p in redo:  # never keep an unsafe settle
+            for k, p in redo:
                 if fresh.get(k, {}).get("action") == "settle_invoice":
                     del fresh[k]
-        for k, d in fresh.items():
-            out[k] = d
-            cache_put(k, d)
+    for k, d in fresh.items():
+        out[k] = d
+        cache_put(k, d)
     for k in todo:
         if k not in out:
             out[k] = {"action": "open_exception",
@@ -410,7 +539,8 @@ def new_task(owner, msg):
     proposals = [make_proposal(data["batchId"], p["packageId"], decisions[package_key(p)]) for p in pkgs]
     print("BATCH", data["batchId"], [p["action"] for p in proposals])
     for _p, _pr in zip(pkgs, proposals):
-        print("DEC", _pr["action"], "|", (det_info(_p)["decisive"] or "NO-DECISIVE-PARA")[:700])
+        _d = decisions[package_key(_p)]
+        print("DEC", _d.get("src", "model"), _pr["action"], "|", (det_info(_p)["decisive"] or "NO-DECISIVE-PARA")[:300])
     print("SAMPLE", json.dumps(pkgs[0])[:3500])
     task = {"id": str(uuid.uuid4()), "contextId": msg.get("contextId") or str(uuid.uuid4()),
             "status": {"state": "TASK_STATE_INPUT_REQUIRED", "timestamp": now()},
@@ -557,7 +687,3 @@ async def cancel(task_id: str, request: Request):
     if bad:
         return bad
     return await run_in_threadpool(do_cancel, owner, task_id)
-
-
-
-
