@@ -1,4 +1,5 @@
-import os, json, uuid, hashlib, sqlite3, threading
+import os, re, json, uuid, hashlib, sqlite3, threading
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 import httpx
 import time
@@ -40,6 +41,15 @@ For each package: 1) find the paragraph that states the current decision and its
 Settling is the most dangerous mistake: paying an invoice that needed approval, a hold,
 duplicate rejection or an exception is far worse than being cautious. Settle ONLY when the
 current-decision paragraph clearly shows a clean, reconciled invoice within authority.
+Format of each package: documents are lists of paragraphs. Evidence references look like [R_XXXX].
+The paragraph called decisiveParagraph (or one of candidateParagraphs) is the one that states the
+current findings, with exactly three references, one per finding. Read each finding literally,
+including negation: "no paid item" means no duplicate; "a paid item was found" may mean a duplicate
+only if the invoice number and amount are the same commercial invoice; a different invoice is not a duplicate.
+Cover-sheet, archive-note and training-appendix references are never evidence. A confident narrative never
+overrides contradictory records; a stated verification that is still pending means hold; a total above
+the delegated authority means request_approval; mismatching purchase order, receipt or ledger means open_exception.
+coverSheetFacts, when present, are the correct supplier, invoice number and amount.
 Work in this order for every package and put your work in the JSON fields, in this order:
  a) decisivePassage: copy verbatim the paragraph that states the CURRENT decision.
  b) ignored: say which other sentences you ignored (archive, training, negated, cover sheet).
@@ -49,7 +59,7 @@ Work in this order for every package and put your work in the JSON fields, in th
     verificationPending true -> hold_invoice; amountAboveAuthority true -> request_approval;
     settle_invoice only if all four are false.
 Reply with JSON only:
-{"decisions":[{"ref":0,"decisivePassage":"...","ignored":"...",
+{"decisions":[{"ref":0,"decisivePassage":"...","findings":["finding 1","finding 2","finding 3"],"ignored":"...",
 "checks":{"duplicateOfPaidInvoice":false,"recordsConflict":false,"verificationPending":false,"amountAboveAuthority":false},
 "action":"...","vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR",
 "evidenceRefs":["[..]","[..]","[..]"],"reason":"one or two sentences"}]}"""
@@ -162,11 +172,79 @@ def cache_put(key, d):
 
 
 
+REF_RE = re.compile(r"\[R_[A-Za-z0-9]+\]")
+FACT_RE = re.compile(r"Supplier\s+(.+?);\s*invoice\s+(\S+?);\s*stated total\s+([A-Z]{3})\s+([0-9][0-9,]*(?:\.[0-9]+)?)")
+NOISE_RE = re.compile(r"The referenced office was [A-Za-z .]+ and the audit export sequence was \d+\.?")
+
+
+def paras(pkg):
+    out = []
+    docs = pkg.get("documents") if isinstance(pkg, dict) else None
+    for d in docs if isinstance(docs, list) else []:
+        text = d.get("text", "") if isinstance(d, dict) else ""
+        name = d.get("name", "") if isinstance(d, dict) else ""
+        for p in re.split(r"\n\s*\n", str(text)):
+            p = p.strip()
+            if p:
+                out.append((name, p))
+    return out
+
+
+def uniq(seq):
+    return list(dict.fromkeys(seq))
+
+
+def det_info(pkg):
+    """Deterministic parts: the paragraph with exactly three bracketed refs, and the cover-sheet facts."""
+    cands = [p for n, p in paras(pkg) if len(uniq(REF_RE.findall(p))) == 3]
+    refs = uniq(REF_RE.findall(cands[0])) if len(cands) == 1 else None
+    facts = None
+    for n, p in paras(pkg):
+        m = FACT_RE.search(p)
+        if m:
+            try:
+                minor = int((Decimal(m.group(4).replace(",", "")) * 100).to_integral_value())
+            except InvalidOperation:
+                break
+            facts = {"vendorName": m.group(1).strip(), "invoiceNumber": m.group(2).strip().rstrip(".,"),
+                     "amountMinor": minor, "currency": m.group(3)}
+            break
+    return {"refs": refs, "facts": facts, "decisive": cands[0] if len(cands) == 1 else None,
+            "candidates": cands}
+
+
+def view(pkg):
+    """Same package without the filler paragraphs, with the decisive paragraph called out."""
+    info = det_info(pkg)
+    docs = []
+    for d in pkg.get("documents", []) if isinstance(pkg.get("documents"), list) else []:
+        keep = []
+        for p in re.split(r"\n\s*\n", str(d.get("text", "") if isinstance(d, dict) else "")):
+            p = p.strip()
+            if not p:
+                continue
+            if NOISE_RE.search(p) and not REF_RE.search(p):
+                continue
+            keep.append(p)
+        docs.append({"name": d.get("name", "") if isinstance(d, dict) else "", "paragraphs": keep})
+    v = {"documents": docs}
+    if info["decisive"]:
+        v["decisiveParagraph"] = info["decisive"]
+    elif info["candidates"]:
+        v["candidateParagraphs"] = info["candidates"]
+    if info["facts"]:
+        v["coverSheetFacts"] = info["facts"]
+    return v
+
+
 
 def clean(a, pkg):
     if not isinstance(a, dict) or a.get("action") not in ACTIONS:
         return None
+    info = det_info(pkg)
     refs = a.get("evidenceRefs")
+    if info["refs"]:
+        refs = info["refs"]
     if isinstance(refs, list):
         refs = [r if isinstance(r, str) and r.startswith("[") else "[" + str(r) + "]" for r in refs]
     text = all_text(pkg)
@@ -188,6 +266,8 @@ def clean(a, pkg):
     facts = {"vendorName": str(a.get("vendorName", "")),
              "invoiceNumber": str(a.get("invoiceNumber", "")),
              "amountMinor": amount, "currency": str(a.get("currency", ""))}
+    if info["facts"]:
+        facts = info["facts"]
     return {"action": a["action"], "facts": facts, "evidenceRefs": refs,
             "reason": str(a.get("reason", ""))[:700]}
 
@@ -206,7 +286,7 @@ def call_model(model, system, user, started, timeout_cap=25):
 
 
 def ask_model(items, policy, started, forbid_settle=False):
-    docs = [{"ref": i, "package": p} for i, (k, p) in enumerate(items)]
+    docs = [{"ref": i, "package": view(p)} for i, (k, p) in enumerate(items)]
     system = RULES
     if forbid_settle:
         system += "\nA reviewer found that settle_invoice is NOT safe for these packages. Do not choose settle_invoice."
@@ -252,7 +332,7 @@ def skeptic_check(item, policy, started):
     k, p = item
     try:
         out = call_model(AI_MODEL_STRONG, SKEPTIC,
-                         json.dumps({"policyRevision": policy, "package": p}), started, 15)
+                         json.dumps({"policyRevision": policy, "package": view(p)}), started, 15)
         return k, bool(out.get("settleIsSafe"))
     except Exception as e:
         print("skeptic error", repr(e)[:200])
@@ -475,3 +555,7 @@ async def cancel(task_id: str, request: Request):
     if bad:
         return bad
     return await run_in_threadpool(do_cancel, owner, task_id)
+
+
+
+
