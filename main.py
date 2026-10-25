@@ -409,6 +409,8 @@ def new_task(owner, msg):
     decisions = decide(pkgs, data.get("policyRevision"))
     proposals = [make_proposal(data["batchId"], p["packageId"], decisions[package_key(p)]) for p in pkgs]
     print("BATCH", data["batchId"], [p["action"] for p in proposals])
+    for _p, _pr in zip(pkgs, proposals):
+        print("DEC", _pr["action"], "|", (det_info(_p)["decisive"] or "NO-DECISIVE-PARA")[:700])
     print("SAMPLE", json.dumps(pkgs[0])[:3500])
     task = {"id": str(uuid.uuid4()), "contextId": msg.get("contextId") or str(uuid.uuid4()),
             "status": {"state": "TASK_STATE_INPUT_REQUIRED", "timestamp": now()},
